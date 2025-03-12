@@ -1,0 +1,134 @@
+import ccxt
+import time
+from datetime import datetime
+import logging
+import sys
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('mexc_short_bot.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configuration
+class Config:
+    API_KEY = 'YOUR_MEXC_API_KEY'  # Replace with your API key
+    API_SECRET = 'YOUR_MEXC_API_SECRET'  # Replace with your secret key
+    SYMBOL = 'BTC_USDT'  # Trading pair (e.g., BTC/USDT)
+    MARGIN = 1000  # Margin in USDT
+    LEVERAGE = 10  # Leverage (up to 400x for USDT-M on MEXC)
+    PURCHASE_HOUR = 15  # Daily short opening time (15:00 UTC)
+
+# Initialize exchange
+exchange = ccxt.mexc({
+    'apiKey': Config.API_KEY,
+    'secret': Config.API_SECRET,
+    'enableRateLimit': True,
+})
+
+class ShortBot:
+    def __init__(self):
+        self.config = Config()
+        exchange.load_markets()
+        # Set leverage
+        try:
+            exchange.private_post_futures_leverage({
+                'symbol': self.config.SYMBOL,
+                'leverage': self.config.LEVERAGE
+            })
+            logger.info(f"Leverage set to {self.config.LEVERAGE}x")
+        except Exception as e:
+            logger.error(f"Error setting leverage: {e}")
+            sys.exit(1)
+
+    def get_next_purchase_time(self) -> datetime:
+        """Calculate next purchase time"""
+        now = datetime.utcnow()
+        target = now.replace(hour=self.config.PURCHASE_HOUR, minute=0, second=0, microsecond=0)
+        if now >= target:
+            target = target.replace(day=target.day + 1)
+        return target
+
+    def check_balance(self) -> bool:
+        """Check account balance"""
+        try:
+            balance = exchange.fetch_balance({'type': 'future'})
+            usdt_balance = float(balance['total'].get('USDT', 0))
+            if usdt_balance < self.config.MARGIN:
+                logger.error(f"Insufficient balance: {usdt_balance} USDT, required {self.config.MARGIN} USDT")
+                return False
+            return True
+        except Exception as e:
+            logger.error(f"Balance check error: {e}")
+            return False
+
+    def open_short(self) -> bool:
+        """Open short position"""
+        try:
+            if not self.check_balance():
+                return False
+
+            # Get current market price
+            ticker = exchange.fetch_ticker(self.config.SYMBOL)
+            current_price = ticker['last']
+
+            # Calculate position size based on margin and leverage
+            position_size = (self.config.MARGIN * self.config.LEVERAGE) / current_price
+
+            # Place short order
+            order = exchange.create_order(
+                symbol=self.config.SYMBOL,
+                type='market',
+                side='sell',
+                amount=position_size,
+                params={
+                    'openType': 1,  # 1 for isolated margin, 2 for cross margin
+                    'positionType': 2,  # 2 for short position
+                }
+            )
+
+            logger.info(f"Short position opened: {order['id']} - {position_size} {self.config.SYMBOL.split('_')[0]} "
+                       f"at {current_price} USDT")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error opening short position: {e}")
+            return False
+
+    def run(self) -> None:
+        """Main bot execution loop"""
+        logger.info("Short Bot started")
+        while True:
+            try:
+                next_purchase = self.get_next_purchase_time()
+                sleep_seconds = (next_purchase - datetime.utcnow()).total_seconds()
+                
+                if sleep_seconds > 0:
+                    logger.info(f"Next short position scheduled for {next_purchase} UTC "
+                               f"({int(sleep_seconds/3600)} hours from now)")
+                    time.sleep(sleep_seconds)
+                
+                logger.info(f"Opening short at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                success = self.open_short()
+                
+                if not success:
+                    logger.warning("Failed to open short, will retry next cycle")
+                    
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                time.sleep(300)  # Wait 5 minutes before retrying on major error
+
+if __name__ == "__main__":
+    # Validate configuration
+    required_configs = [Config.API_KEY, Config.API_SECRET]
+    if any("YOUR_" in config for config in required_configs):
+        logger.error("Please configure API_KEY and API_SECRET")
+        sys.exit(1)
+
+    bot = ShortBot()
+    bot.run()
